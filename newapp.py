@@ -2,11 +2,11 @@
 Run locally: python -m streamlit run newapp.py
 """
 import io
+import re
 from datetime import date, datetime
 from copy import copy
 import pandas as pd
 import numpy as np
-import re
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
@@ -39,6 +39,20 @@ def get_site_master(students_bytes):
     if result.empty:
         raise ValueError('No sites found in student Participant Attendance Hours.')
     return result
+
+
+def clean_session_rows(df, site_master, report_name):
+    """Normalize merge keys and check grant sites without editing uploads."""
+    for col in ["Site", "Activity", "Session"]:
+        df[col] = df[col].astype("string").str.strip()
+    df = df.loc[
+        df["Site"].notna() & df["Site"].ne("")
+        & ~df["Site"].str.lower().isin(["total", "subtotal", "average"])
+    ].copy()
+    unexpected = set(df["Site"]) - set(site_master["Site"])
+    if unexpected:
+        raise ValueError(f"Sites missing from master list in {report_name}: {unexpected}")
+    return df.reset_index(drop=True)
 
 
 from openpyxl import load_workbook
@@ -81,22 +95,38 @@ def apply_missing_highlights(output_filename, total_missing_rows, flag_cols, you
     if site_tables is not None:
         for site_name in site_tables:
             ws = wb[clean_sheet_name(site_name)]
+            headers = {cell.value: cell.column for cell in ws[1]}
             for row in ws.iter_rows(min_row=2):
                 for cell in row:
                     column_name = ws.cell(row=1, column=cell.column).value
                     is_blank = cell.value is None or str(cell.value).strip() in ['', '-']
                     assignment_missing = column_name in ['Staff Assigned', 'Partner Assigned'] and str(cell.value).strip().upper() == 'N'
-                    if is_blank or assignment_missing:
+                    if (is_blank and column_name != "Dates Missing Attendance") or assignment_missing:
                         cell.fill = red_fill
+                count_col = "Days Missing Attendance to Date"
+                if count_col in headers:
+                    count = ws.cell(row=row[0].row, column=headers[count_col]).value
+                    try:
+                        has_missing = float(count) > 0
+                    except (TypeError, ValueError):
+                        has_missing = False
+                    if has_missing:
+                        for name in [count_col, "Missing Attendance (%)", "Dates Missing Attendance"]:
+                            if name in headers:
+                                ws.cell(row=row[0].row, column=headers[name]).fill = red_fill
     output_filename.seek(0)
     output_filename.truncate(0)
     wb.save(output_filename)
     wb.close()
 
-def build_report(students_bytes, adults_bytes, all_bytes, target_values, progress=None):
+def build_report(students_bytes, adults_bytes, all_bytes, target_values, progress=None,
+                 annual_schedule_bytes=None, missing_attendance_bytes=None):
     """Process uploaded workbook bytes; return the final XLSX bytes."""
     if progress is None:
         progress = lambda message: None
+
+    if annual_schedule_bytes is None or missing_attendance_bytes is None:
+        raise ValueError("Upload both Full-Year Activity/Session Details and Gary's Missing Attendance Report.")
 
     site_master = get_site_master(students_bytes)
     if len(site_master) != len(target_values):
@@ -355,14 +385,14 @@ def build_report(students_bytes, adults_bytes, all_bytes, target_values, progres
 
     cols_act = ['Site', 'Activity', 'Session', 'Days Scheduled', 'Session Start Date', 'Designated Staff', 'Partners']
     df_act = df_act[cols_act].copy()
-    df_act = df_act.rename(columns={'Designated Staff': 'Staff Assigned', 'Partners': 'Partner'})
+    df_act = df_act.rename(columns={'Days Scheduled': 'Days Scheduled to Date', 'Designated Staff': 'Staff Assigned', 'Partners': 'Partner'})
     for col in ['Staff Assigned', 'Partner']:
         df_act[col] = df_act[col].astype('string').str.strip()
         df_act.loc[df_act[col].str.lower().isin(['', 'not entered', 'nan', 'none']), col] = pd.NA
     df_act['Partner Assigned'] = np.where(df_act['Partner'].notna(), 'Y', 'N')
     df_act['Staff Assigned'] = np.where(df_act['Staff Assigned'].notna(), 'Y', 'N')
     today = pd.Timestamp.now("America/New_York").normalize().tz_localize(None)
-    df_act["Days Scheduled"] = pd.to_numeric(df_act["Days Scheduled"], errors="coerce")
+    df_act["Days Scheduled to Date"] = pd.to_numeric(df_act["Days Scheduled to Date"], errors="coerce").astype("Int64")
     df_act["Session Start Date"] = pd.to_datetime(df_act["Session Start Date"], errors="coerce")
 
     cols_enr = ['Site', 'Activity', 'Session', 'Enrolled Count']
@@ -376,28 +406,103 @@ def build_report(students_bytes, adults_bytes, all_bytes, target_values, progres
     df_att['Total'] = pd.to_numeric(attendance_text, errors='coerce').round().astype('Int64')
     df_att = df_att.rename(columns={'Total': 'Average Daily Attendance'})
 
-    sites = site_master['Site'].tolist()
-    merge_keys = ['Site', 'Activity', 'Session']
-    df_act = df_act.drop_duplicates().reset_index(drop=True)
-    for report_name, report_df in [('Activity-Session Details', df_act), ('Session Enrollment by Session', df_enr), ('Daily Activity Attendance Summary', df_att)]:
-        duplicates = report_df.duplicated(subset=merge_keys, keep=False)
-        if duplicates.any():
-            raise ValueError(f'Review duplicate sessions in {report_name} before merging.')
+    # Full-year scheduled days are separate from the to-date denominator.
+    merge_keys = ["Site", "Activity", "Session"]
+    progress("Reading Full-Year Activity/Session Details…")
+    df_annual = read_table(
+        annual_schedule_bytes, "Activity-Session Details",
+        merge_keys + ["Days Scheduled"]
+    )[merge_keys + ["Days Scheduled"]].copy()
+    df_annual = clean_session_rows(df_annual, site_master, "Full-Year Activity/Session Details")
+    df_annual["Days Scheduled"] = pd.to_numeric(
+        df_annual["Days Scheduled"], errors="coerce"
+    ).astype("Int64")
+    df_annual = df_annual.drop_duplicates()
+    if df_annual.duplicated(merge_keys).any():
+        raise ValueError("Conflicting annual scheduled-day counts for the same Site / Activity / Session.")
+    df_act = df_act.merge(df_annual, on=merge_keys, how="left", validate="many_to_one", indicator="_annual_match")
+    unmatched = df_act["_annual_match"].eq("left_only")
+    if unmatched.any():
+        progress(f"Warning: {len(df_act.loc[unmatched, merge_keys].drop_duplicates())} sessions have no matching full-year schedule; yearly Days Scheduled will be blank.")
+    df_act = df_act.drop(columns="_annual_match")
 
+    # Count unique missing dates and concatenate dates chronologically.
+    progress("Processing Gary's Missing Attendance Report…")
+    sheet_name = next(
+        (name for name in pd.ExcelFile(io.BytesIO(missing_attendance_bytes)).sheet_names
+         if "Missing Attendance" in name), None
+    )
+    if sheet_name is None:
+        raise ValueError("Missing Attendance report sheet not found.")
+    df_missing_att = read_table(
+        missing_attendance_bytes, sheet_name, merge_keys + ["Date"]
+    )[merge_keys + ["Date"]].copy()
+    df_missing_att = clean_session_rows(df_missing_att, site_master, "Gary's Missing Attendance Report")
+    if df_missing_att[merge_keys].isna().any().any() or df_missing_att[merge_keys].eq("").any().any():
+        raise ValueError("Missing site, activity, or session in Gary's Missing Attendance Report.")
+    df_missing_att["Date"] = pd.to_datetime(df_missing_att["Date"], errors="coerce").dt.normalize()
+    if df_missing_att["Date"].isna().any():
+        raise ValueError("Invalid or missing dates in Gary's Missing Attendance Report.")
+    df_missing_att = df_missing_att.drop_duplicates(merge_keys + ["Date"]).sort_values(merge_keys + ["Date"])
+    df_missing_att["Date Text"] = df_missing_att["Date"].dt.strftime("%m/%d/%Y")
+    missing_attendance_summary = df_missing_att.groupby(merge_keys).agg(**{
+        "Days Missing Attendance": ("Date", "nunique"),
+        "Dates Missing Attendance": ("Date Text", lambda dates: "; ".join(dates)),
+    }).reset_index()
+
+    sites = site_master["Site"].tolist()
+    df_act = df_act.drop_duplicates().reset_index(drop=True)
+    for report_name, report_df in [
+        ("Activity-Session Details", df_act),
+        ("Session Enrollment by Session", df_enr),
+        ("Daily Activity Attendance Summary", df_att),
+    ]:
+        if report_df.duplicated(merge_keys).any():
+            raise ValueError(f"Review duplicate sessions in {report_name} before merging.")
+
+    known_sessions = pd.concat([df_act[merge_keys], df_enr[merge_keys], df_att[merge_keys]], ignore_index=True).drop_duplicates()
+    unmatched_missing = missing_attendance_summary.merge(known_sessions, on=merge_keys, how="left", indicator=True)
+    unmatched_keys = unmatched_missing.loc[unmatched_missing["_merge"].eq("left_only"), merge_keys]
+    if not unmatched_keys.empty:
+        examples = "; ".join(" / ".join(str(row[col]) for col in merge_keys) for _, row in unmatched_keys.head(5).iterrows())
+        raise ValueError(f"Missing-attendance sessions were not found in the session reports: {examples}. Check institution, academic year, report period, and session names.")
+
+    progress("Building Site Session Tables…")
     site_tables = {}
-    output_columns = ['Site', 'Activity', 'Session', 'Days Scheduled', 'Enrolled Participant', 'Average Daily Attendance', 'Staff Assigned', 'Partner Assigned', 'Partner']
+    output_columns = [
+        "Site", "Activity", "Session", "Days Scheduled",
+        "Enrolled Participant", "Average Daily Attendance",
+        "Missing Attendance (%)", "Staff Assigned", "Partner Assigned",
+        "Days Scheduled to Date", "Days Missing Attendance to Date",
+        "Dates Missing Attendance", "Partner",
+    ]
     for site in sites:
-        site_act = df_act.loc[df_act['Site'] == site].copy()
-        site_enr = df_enr.loc[df_enr['Site'] == site].copy()
-        site_att = df_att.loc[df_att['Site'] == site].copy()
-        merged_site = site_act.merge(site_enr, on=merge_keys, how='outer', validate='one_to_one')
-        merged_site = merged_site.merge(site_att, on=merge_keys, how='outer', validate='one_to_one')
-        for col in ['Staff Assigned', 'Partner Assigned']:
-            merged_site[col] = merged_site[col].fillna('N')
-        merged_site = merged_site.loc[merged_site['Session Start Date'].isna() | merged_site['Session Start Date'].lt(today)].copy()
-        merged_site = merged_site[output_columns].sort_values(['Activity', 'Session']).reset_index(drop=True)
-        merged_site = merged_site.astype(object).where(merged_site.notna(), '-')
-        site_tables[site] = merged_site
+        site_act = df_act.loc[df_act["Site"] == site].copy()
+        site_enr = df_enr.loc[df_enr["Site"] == site].copy()
+        site_att = df_att.loc[df_att["Site"] == site].copy()
+        site_missing = missing_attendance_summary.loc[missing_attendance_summary["Site"] == site].copy()
+        merged_site = site_act.merge(site_enr, on=merge_keys, how="outer", validate="one_to_one")
+        merged_site = merged_site.merge(site_att, on=merge_keys, how="outer", validate="one_to_one")
+        merged_site = merged_site.merge(site_missing, on=merge_keys, how="left", validate="one_to_one")
+        merged_site = merged_site.loc[
+            merged_site["Session Start Date"].isna()
+            | merged_site["Session Start Date"].lt(today)
+        ].copy()
+        merged_site["Days Missing Attendance"] = merged_site["Days Missing Attendance"].fillna(0).astype("Int64")
+        merged_site["Dates Missing Attendance"] = merged_site["Dates Missing Attendance"].fillna("-")
+        for col in ["Staff Assigned", "Partner Assigned"]:
+            merged_site[col] = merged_site[col].fillna("N")
+        for col in ["Days Scheduled", "Days Scheduled to Date"]:
+            merged_site[col] = pd.to_numeric(merged_site[col], errors="coerce").astype("Int64")
+        denominator = merged_site["Days Scheduled to Date"]
+        missing_pct = merged_site["Days Missing Attendance"].div(denominator.where(denominator > 0)).mul(100)
+        merged_site["Missing Attendance (%)"] = (missing_pct.round().astype("Int64").astype("string") + "%").fillna("-")
+        inconsistent = merged_site["Days Missing Attendance"].gt(denominator).fillna(False)
+        if inconsistent.any():
+            progress(f"Warning: {int(inconsistent.sum())} session(s) at {site} have more missing dates than scheduled days to date. Check report periods; percentages have not been capped.")
+        merged_site = merged_site.rename(columns={"Days Missing Attendance": "Days Missing Attendance to Date"})
+        merged_site = merged_site[output_columns].sort_values(["Activity", "Session"]).reset_index(drop=True)
+        site_tables[site] = merged_site.astype(object).where(merged_site.notna(), "-")
 
     progress("Writing Excel Report…")
     output_filename = io.BytesIO()
@@ -459,7 +564,7 @@ def main():
         page_title="Weekly Update Report Tool", page_icon="📊", layout="centered"
     )
     st.title("📊 Weekly Update Report Tool")
-    st.markdown("Upload three Excel workbooks, confirm each site's target, and download your weekly report.")
+    st.markdown("Upload five Excel workbooks, confirm each site's target, and download your weekly report.")
     st.subheader("Step 1 · Upload Your Excel Files")
     columns = st.columns(3)
     with columns[0]:
@@ -469,6 +574,17 @@ def main():
     with columns[2]:
         all_file = st.file_uploader("📋 Grant Level File", type=["xlsx"], key="all")
 
+    extra_columns = st.columns(2)
+    with extra_columns[0]:
+        annual_file = st.file_uploader(
+            "📅 Full-Year Activity/Session Details", type=["xlsx"], key="annual_schedule"
+        )
+    with extra_columns[1]:
+        missing_file = st.file_uploader(
+            "📝 Gary's Missing Attendance Report", type=["xlsx"], key="missing_attendance"
+        )
+    st.caption("Use the same institution and academic year for all five files. The Grant Level and Gary's reports must cover the same to-date reporting period; the full-year schedule must cover the entire academic year.")
+
     st.divider()
     institution_name = st.text_input("🏫 Institution Name", value="Institution")
     st.subheader("Step 2 · Set Target Enrollment per Site")
@@ -477,6 +593,8 @@ def main():
     students_bytes = students_file.getvalue() if students_file is not None else None
     adults_bytes = adults_file.getvalue() if adults_file is not None else None
     all_bytes = all_file.getvalue() if all_file is not None else None
+    annual_schedule_bytes = annual_file.getvalue() if annual_file is not None else None
+    missing_attendance_bytes = missing_file.getvalue() if missing_file is not None else None
     target_values = []
     sites_ready = False
     if students_bytes is not None:
@@ -494,16 +612,17 @@ def main():
     else:
         st.info("Upload the Students file to show the sites and enter their targets.")
 
-    ready = sites_ready and adults_bytes is not None and all_bytes is not None
+    ready = (sites_ready and adults_bytes is not None and all_bytes is not None
+             and annual_schedule_bytes is not None and missing_attendance_bytes is not None)
     st.divider()
     st.subheader("Step 3 · Generate Report")
     if not ready:
-        st.warning("Upload all three .xlsx files and check the site targets before generating.")
+        st.warning("Upload all five .xlsx files and check the site targets before generating.")
 
     # Invalidate an earlier report when uploads, targets, or institution change.
     import hashlib
     fingerprint = hashlib.sha256()
-    for value in (students_bytes, adults_bytes, all_bytes):
+    for value in (students_bytes, adults_bytes, all_bytes, annual_schedule_bytes, missing_attendance_bytes):
         fingerprint.update(hashlib.sha256(value or b"").digest())
     fingerprint.update(repr((institution_name, target_values)).encode())
     current_key = fingerprint.hexdigest()
@@ -522,16 +641,14 @@ def main():
             try:
                 data = build_report(
                     students_bytes, adults_bytes, all_bytes,
-                    target_values, progress=progress
+                    target_values, progress=progress,
+                    annual_schedule_bytes=annual_schedule_bytes,
+                    missing_attendance_bytes=missing_attendance_bytes
                 )
                 st.session_state.output_bytes = data
-
-                safe_institution = re.sub(
-                    r'[\\/:*?"<>|]', "_", institution_name.strip()
-                    ).replace(" ", "_") or "Institution"
+                safe_institution = re.sub(r'[\\/:*?"<>|]', '_', institution_name.strip()).replace(' ', '_') or 'Institution'
                 date_str = pd.Timestamp.now("America/New_York").strftime("%Y%m%d")
-                st.session_state.output_filename = (f"WeeklyUpdates_{safe_institution}_{date_str}.xlsx")
-
+                st.session_state.output_filename = f"WeeklyUpdates_{safe_institution}_{date_str}.xlsx"
                 st.session_state.report_input_key = current_key
                 status.update(label="✅ Report ready!", state="complete")
             except Exception as exc:
